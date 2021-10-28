@@ -572,7 +572,7 @@ namespace Microsoft.EntityFrameworkCore.Query.SqlExpressions
                                     innerShaperExpression);
                             }
 
-                            AddJoin(JoinType.OuterApply, ref innerSelectExpression);
+                            AddJoin(JoinType.OuterApply, ref innerSelectExpression, out _);
                             var offset = _clientProjections.Count;
                             var count = innerSelectExpression._clientProjections.Count;
                             _clientProjections.AddRange(
@@ -650,7 +650,7 @@ namespace Microsoft.EntityFrameworkCore.Query.SqlExpressions
 #endif
                                 var parentIdentifier = GetIdentifierAccessor(this, newClientProjections, actualParentIdentifier).Item1;
 
-                                outerSelectExpression.AddCrossApply(innerSelectExpression);
+                                outerSelectExpression.AddJoin(JoinType.CrossApply, ref innerSelectExpression, out var pushdownOccurredWhenJoining);
                                 outerSelectExpression._clientProjections.AddRange(innerSelectExpression._clientProjections);
                                 outerSelectExpression._aliasForClientProjections.AddRange(innerSelectExpression._aliasForClientProjections);
                                 innerSelectExpression = outerSelectExpression;
@@ -670,18 +670,29 @@ namespace Microsoft.EntityFrameworkCore.Query.SqlExpressions
                                     var innerOrderingExpressions = new List<OrderingExpression>();
                                     if (orderingsToBeErased != null)
                                     {
-                                        var subquery = (SelectExpression)collectionJoinedInnerTable;
                                         // Ordering was present but erased so we add again
-                                        foreach (var ordering in orderingsToBeErased)
+                                        if (pushdownOccurredWhenJoining)
                                         {
-                                            innerOrderingExpressions.Add(
-                                                new OrderingExpression(
-                                                    subquery.GenerateOuterColumn(collectionJoinedTableReference, ordering.Expression),
-                                                    ordering.IsAscending));
+                                            // We lift from inner subquery if pushdown occurred with ordering erased
+                                            var subquery = (SelectExpression)collectionJoinedInnerTable;
+                                            foreach (var ordering in orderingsToBeErased)
+                                            {
+                                                innerOrderingExpressions.Add(
+                                                    new OrderingExpression(
+                                                        subquery.GenerateOuterColumn(collectionJoinedTableReference, ordering.Expression),
+                                                        ordering.IsAscending));
+                                            }
+                                        }
+                                        else
+                                        {
+                                            // We copy from inner if pushdown did not happen but ordering was left behind when
+                                            // generating join
+                                            innerOrderingExpressions.AddRange(orderingsToBeErased);
                                         }
                                     }
                                     else
                                     {
+                                        // If orderings were not erased then they must be present in inner
                                         GetOrderingsFromInnerTable(
                                             collectionJoinedInnerTable,
                                             collectionJoinedTableReference,
@@ -722,20 +733,58 @@ namespace Microsoft.EntityFrameworkCore.Query.SqlExpressions
 
                                 innerShaperExpression = innerSelectExpression.ApplyProjection(
                                     innerShaperExpression, shapedQueryExpression.ResultCardinality, querySplittingBehavior);
-                                AddJoin(JoinType.OuterApply, ref innerSelectExpression);
-                                var innerOrderingExpressions = new List<OrderingExpression>();
 
-                                if (!GetOrderingsFromInnerTable(
-                                    innerSelectExpression._tables[0],
-                                    innerSelectExpression._tableReferences[0],
-                                    innerOrderingExpressions))
+                                var containsOrdering = innerSelectExpression.Orderings.Count > 0;
+                                List<OrderingExpression>? orderingsToBeErased = null;
+                                if (containsOrdering
+                                    && innerSelectExpression.Limit == null
+                                    && innerSelectExpression.Offset == null)
                                 {
-                                    innerOrderingExpressions.AddRange(innerSelectExpression.Orderings);
+                                    orderingsToBeErased = innerSelectExpression.Orderings.ToList();
                                 }
+                                AddJoin(JoinType.OuterApply, ref innerSelectExpression, out var pushdownOccurredWhenJoining);
 
-                                foreach (var ordering in innerOrderingExpressions)
+                                // Copy over any nested ordering if there were any
+                                if (containsOrdering)
                                 {
-                                    AppendOrdering(ordering.Update(MakeNullable(ordering.Expression, nullable: true)));
+                                    var collectionJoinedInnerTable = innerSelectExpression._tables[0];
+                                    var collectionJoinedTableReference = innerSelectExpression._tableReferences[0];
+                                    var innerOrderingExpressions = new List<OrderingExpression>();
+                                    if (orderingsToBeErased != null)
+                                    {
+                                        // Ordering was present but erased so we add again
+                                        if (pushdownOccurredWhenJoining)
+                                        {
+                                            // We lift from inner subquery if pushdown occurred with ordering erased
+                                            var subquery = (SelectExpression)collectionJoinedInnerTable;
+                                            foreach (var ordering in orderingsToBeErased)
+                                            {
+                                                innerOrderingExpressions.Add(
+                                                    new OrderingExpression(
+                                                        subquery.GenerateOuterColumn(collectionJoinedTableReference, ordering.Expression),
+                                                        ordering.IsAscending));
+                                            }
+                                        }
+                                        else
+                                        {
+                                            // We copy from inner if pushdown did not happen but ordering was left behind when
+                                            // generating join
+                                            innerOrderingExpressions.AddRange(orderingsToBeErased);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        // If orderings were not erased then they must be present in inner
+                                        GetOrderingsFromInnerTable(
+                                            collectionJoinedInnerTable,
+                                            collectionJoinedTableReference,
+                                            innerOrderingExpressions);
+                                    }
+
+                                    foreach (var ordering in innerOrderingExpressions)
+                                    {
+                                        AppendOrdering(ordering.Update(MakeNullable(ordering.Expression, nullable: true)));
+                                    }
                                 }
 
                                 innerShaperExpression = CopyProjectionToOuter(innerSelectExpression, innerShaperExpression);
@@ -830,11 +879,13 @@ namespace Microsoft.EntityFrameworkCore.Query.SqlExpressions
 
                 return shaperExpression;
 
-                bool GetOrderingsFromInnerTable(
+                void GetOrderingsFromInnerTable(
                     TableExpressionBase tableExpressionBase,
                     TableReferenceExpression tableReferenceExpression,
                     List<OrderingExpression> orderings)
                 {
+                    // If operation was converted to predicate join (inner/left join),
+                    // then ordering will be in rownumber expression
                     if (tableExpressionBase is SelectExpression joinedSubquery
                         && joinedSubquery.Predicate != null
                         && joinedSubquery.Tables.Count == 1
@@ -862,11 +913,9 @@ namespace Microsoft.EntityFrameworkCore.Query.SqlExpressions
                                         rowNumberSubquery.GenerateOuterColumn(rowNumberSubqueryTableReference, ordering.Expression)),
                                     ordering.IsAscending));
                         }
-
-                        return true;
                     }
-
-                    if (tableExpressionBase is SelectExpression collectionSelectExpression
+                    // If operation remained apply then ordering will be in the subquery
+                    else if (tableExpressionBase is SelectExpression collectionSelectExpression
                         && collectionSelectExpression.Orderings.Count > 0)
                     {
                         foreach (var ordering in collectionSelectExpression.Orderings)
@@ -876,11 +925,7 @@ namespace Microsoft.EntityFrameworkCore.Query.SqlExpressions
                                     collectionSelectExpression.GenerateOuterColumn(tableReferenceExpression, ordering.Expression),
                                     ordering.IsAscending));
                         }
-
-                        return true;
                     }
-
-                    return false;
                 }
 
                 Expression CopyProjectionToOuter(SelectExpression innerSelectExpression, Expression innerShaperExpression)
@@ -1917,7 +1962,7 @@ namespace Microsoft.EntityFrameworkCore.Query.SqlExpressions
             Expression innerShaper,
             SqlExpression? joinPredicate = null)
         {
-            AddJoin(joinType, ref innerSelectExpression, joinPredicate);
+            AddJoin(joinType, ref innerSelectExpression, out _, joinPredicate);
 
             var transparentIdentifierType = TransparentIdentifierFactory.Create(outerShaper.Type, innerShaper.Type);
             var outerMemberInfo = transparentIdentifierType.GetTypeInfo().GetRequiredDeclaredField("Outer");
@@ -2023,8 +2068,10 @@ namespace Microsoft.EntityFrameworkCore.Query.SqlExpressions
         private void AddJoin(
             JoinType joinType,
             ref SelectExpression innerSelectExpression,
+            out bool innerPushdownOccurred,
             SqlExpression? joinPredicate = null)
         {
+            innerPushdownOccurred = false;
             // Try to convert Apply to normal join
             if (joinType == JoinType.CrossApply
                 || joinType == JoinType.OuterApply)
@@ -2099,7 +2146,9 @@ namespace Microsoft.EntityFrameworkCore.Query.SqlExpressions
 
                             AddJoin(
                                 joinType == JoinType.CrossApply ? JoinType.InnerJoin : JoinType.LeftJoin,
-                                ref innerSelectExpression, joinPredicate);
+                                ref innerSelectExpression,
+                                out innerPushdownOccurred,
+                                joinPredicate);
 
                             return;
                         }
@@ -2131,8 +2180,7 @@ namespace Microsoft.EntityFrameworkCore.Query.SqlExpressions
                 joinPredicate = sqlRemappingVisitor.Remap(joinPredicate);
             }
 
-            if (innerSelectExpression.Orderings.Count > 0
-                || innerSelectExpression.Limit != null
+            if (innerSelectExpression.Limit != null
                 || innerSelectExpression.Offset != null
                 || innerSelectExpression.IsDistinct
                 || innerSelectExpression.Predicate != null
@@ -2140,6 +2188,7 @@ namespace Microsoft.EntityFrameworkCore.Query.SqlExpressions
                 || innerSelectExpression.GroupBy.Count > 0)
             {
                 joinPredicate = innerSelectExpression.PushdownIntoSubqueryInternal().Remap(joinPredicate);
+                innerPushdownOccurred = true;
             }
 
             if (_identifier.Count > 0
@@ -2481,7 +2530,7 @@ namespace Microsoft.EntityFrameworkCore.Query.SqlExpressions
             Check.NotNull(innerSelectExpression, nameof(innerSelectExpression));
             Check.NotNull(joinPredicate, nameof(joinPredicate));
 
-            AddJoin(JoinType.InnerJoin, ref innerSelectExpression, joinPredicate);
+            AddJoin(JoinType.InnerJoin, ref innerSelectExpression, out _, joinPredicate);
         }
 
         /// <summary>
@@ -2494,7 +2543,7 @@ namespace Microsoft.EntityFrameworkCore.Query.SqlExpressions
             Check.NotNull(innerSelectExpression, nameof(innerSelectExpression));
             Check.NotNull(joinPredicate, nameof(joinPredicate));
 
-            AddJoin(JoinType.LeftJoin, ref innerSelectExpression, joinPredicate);
+            AddJoin(JoinType.LeftJoin, ref innerSelectExpression, out _, joinPredicate);
         }
 
         /// <summary>
@@ -2505,7 +2554,7 @@ namespace Microsoft.EntityFrameworkCore.Query.SqlExpressions
         {
             Check.NotNull(innerSelectExpression, nameof(innerSelectExpression));
 
-            AddJoin(JoinType.CrossJoin, ref innerSelectExpression);
+            AddJoin(JoinType.CrossJoin, ref innerSelectExpression, out _);
         }
 
         /// <summary>
@@ -2516,7 +2565,7 @@ namespace Microsoft.EntityFrameworkCore.Query.SqlExpressions
         {
             Check.NotNull(innerSelectExpression, nameof(innerSelectExpression));
 
-            AddJoin(JoinType.CrossApply, ref innerSelectExpression);
+            AddJoin(JoinType.CrossApply, ref innerSelectExpression, out _);
         }
 
         /// <summary>
@@ -2527,7 +2576,7 @@ namespace Microsoft.EntityFrameworkCore.Query.SqlExpressions
         {
             Check.NotNull(innerSelectExpression, nameof(innerSelectExpression));
 
-            AddJoin(JoinType.OuterApply, ref innerSelectExpression);
+            AddJoin(JoinType.OuterApply, ref innerSelectExpression, out _);
         }
 
         /// <summary>
